@@ -693,15 +693,10 @@ async function fetchStrmInnerText(r) {
     // plex strm downloadApi自己返回301，response.redirected api错误返回false
     if (response.status > 300 && response.status < 309) {
       const location = response.headers["Location"];
-      let strmInnerText = location;
-      const tmpArr = plexHost.split(":");
-      const plexHostWithoutPort = `${tmpArr[0]}:${tmpArr[1]}`;
-      if (location.startsWith(plexHostWithoutPort)) {
-        // strmInnerText是本地路径
-        strmInnerText = location.replace(plexHostWithoutPort, "");
-      }
-      r.log(`fetchStrmInnerText: ${strmInnerText}`);
-      return decodeURI(strmInnerText);
+      // 对于STRM文件，我们直接返回重定向位置，不做任何修改
+      // 因为它可能指向完全不同的服务（如AList、CloudDrive等）
+      r.log(`fetchStrmInnerText: ${location}，decodeURI(location): ${decodeURI(location)}`);
+      return decodeURI(location);
     }
     if (response.ok) {
       r.log(`fetchStrmInnerText: ${response.text()}`);
