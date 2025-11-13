@@ -20,6 +20,10 @@ const alistSignExpireTime = 12;
 // alist 公网地址,用于需要 alist server 代理流量的情况,按需填写
 const alistPublicAddr = "http://youralist.com:5244";
 
+// 新增配置：MS服务地址和API密钥
+const msAddr = "http://192.168.4.37:8888";
+const msApiKey = "sk-bc007061a4974cdba18f5afc37f7ecef";
+
 // 指定客户端自己请求并获取 alist 直链的规则,代码优先级在 redirectStrmLastLinkRule 之后
 // 特殊情况使用,则此处必须使用域名且公网畅通,用不着请保持默认
 // 参数?.1: 分组名,组内为与关系(全部匹配),多个组和没有分组的规则是或关系(任一匹配),然后下面参数序号-1
@@ -47,6 +51,9 @@ const redirectCheckEnable = false;
 const fallbackUseOriginal = true;
 
 export default {
+    msAddr,
+    msApiKey,
+
   alistAddr,
   alistToken,
   alistSignEnable,

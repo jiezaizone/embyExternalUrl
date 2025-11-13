@@ -30,7 +30,7 @@ async function redirect2Pan(r) {
     r.warn(`required plex clients self report, skip modify`);
     return internalRedirect(r);
   }
-  
+
   // check route cache
   const routeCacheConfig = config.routeCacheConfig;
   if (routeCacheConfig.enable) {
@@ -148,7 +148,7 @@ async function redirect2Pan(r) {
   const isRelative = !util.isAbsolutePath(mediaItemPath);
   if (isRelative) {
     let rule = util.simpleRuleFilter(
-      r, config.redirectStrmLastLinkRule, mediaItemPath, 
+      r, config.redirectStrmLastLinkRule, mediaItemPath,
       util.SOURCE_STR_ENUM.filePath, "redirectStrmLastLinkRule"
     );
     if (rule && rule.length > 0) {
@@ -183,23 +183,81 @@ async function redirect2Pan(r) {
   // fetch alist direct link
   const alistToken = config.alistToken;
   const alistAddr = config.alistAddr;
+  const msAddr = config.msAddr;
+  const msApiKey = config.msApiKey;
   const alistFilePath = mediaItemPath;
   const alistFsGetApiPath = `${alistAddr}/api/fs/get`;
-  const alistRes = await util.cost(fetchAlistPathApi,
-    alistFsGetApiPath,
-    alistFilePath,
-    alistToken,
-    ua,
-  );
+  
+  // 使用新的MS API获取直链
+  let alistRes;
+  let isUsingMsApi = false;
+  if (msAddr && msApiKey) {
+    const msApiPath = `${msAddr}/api/v1/cloudStorage/strm302?apiKey=${msApiKey}&path=${encodeURIComponent(alistFilePath)}`;
+    r.warn(`fetching direct link from MS API: ${msApiPath}`);
+    try {
+      const response = await ngx.fetch(msApiPath, {
+        method: "GET",
+        headers: {
+          "User-Agent": ua,
+        },
+        max_response_body_size: 65535
+      });
+      
+      r.warn(`MS API response status: ${response.status}`);
+      r.warn(`MS API response headers: ${JSON.stringify(response.headers)}`);
+      // r.warn(`MS API response: ${JSON.stringify(response)}`);
+      
+      // 处理302重定向响应，获取Location头中的URL
+      if (response.status === 302 || response.status === 301) {
+        const location = response.headers["Location"];
+        if (location) {
+          r.warn(`MS API returned redirect to: ${location}`);
+          alistRes = location;
+          isUsingMsApi = true;
+        } else {
+          alistRes = `error: MS API returned ${response.status} without Location header`;
+        }
+      } else if (response.ok) {
+        const result = await response.json();
+        r.warn(`MS API response body: ${JSON.stringify(result)}`);
+        if (result && result.url) {
+          alistRes = result.url;
+          isUsingMsApi = true;
+        } else {
+          alistRes = `error: MS API returned invalid response`;
+        }
+      } else {
+        alistRes = `error: MS API returned status ${response.status}`;
+      }
+    } catch (error) {
+      r.error(`MS API request failed: ${error}`);
+      alistRes = `error: MS API request failed ${error}`;
+    }
+  } else {
+    // 回退到原来的逻辑
+    ngx.log(ngx.WARN, `about to call fetchAlistPathApi with: apiPath=${alistFsGetApiPath}, filePath=${alistFilePath}`);
+    alistRes = await util.cost(fetchAlistPathApi,
+      alistFsGetApiPath,
+      alistFilePath,
+      alistToken,
+      ua,
+    );
+  }
+  
   r.warn(`fetchAlistPathApi, UA: ${ua}`);
+  r.warn(`fetchAlistPathApi result: ${alistRes}`);
   if (!alistRes.startsWith("error")) {
     // routeRule, there is only check for alistRes on proxy mode
+    r.warn(`checking route mode for alistRes: ${alistRes}`);
     const routeMode = util.getRouteMode(r, alistRes, true, notLocal);
+    r.warn(`routeMode result: ${routeMode}`);
     if (util.ROUTE_ENUM.proxy === routeMode) {
       return internalRedirect(r); // use original link
     }
     // clientSelfAlistRule, after fetch alist, cover raw_url
-    let redirectUrl = util.getClientSelfAlistLink(r, alistRes, alistFilePath) ?? alistRes;
+    // 如果是使用MS API获取的链接，则跳过clientSelfAlistRule处理
+    let redirectUrl = isUsingMsApi ? alistRes : (util.getClientSelfAlistLink(r, alistRes, alistFilePath) ?? alistRes);
+    r.warn(`getClientSelfAlistLink result: ${redirectUrl}`);
     const key = "alistRawUrlMapping";
     if (config[key] && config[key].length > 0) {
       const mappedUrl = util.doUrlMapping(r, redirectUrl, notLocal, config[key], key);
@@ -220,12 +278,14 @@ async function redirect2Pan(r) {
     // const filePath = alistFilePath.substring(alistFilePath.indexOf("/", 1));
     const filePath = alistFilePath;
     const alistFsListApiPath = `${alistAddr}/api/fs/list`;
+    r.warn(`about to call fetchAlistPathApi for fs/list: apiPath=${alistFsListApiPath}, filePath=/`);
     const foldersRes = await fetchAlistPathApi(
       alistFsListApiPath,
       "/",
       alistToken,
       ua,
     );
+    r.warn(`fetchAlistPathApi fs/list result: ${foldersRes}`);
     if (foldersRes.startsWith("error")) {
       r.error(`fail to fetch /api/fs/list: ${foldersRes},fallback use original link`);
       return fallbackUseOriginal ? internalRedirect(r) : r.return(500, foldersRes);
@@ -635,7 +695,7 @@ function cachePartInfo(r, part, isXmlNode) {
 
 function routeCachePartInfo(r, partKey) {
   if (!partKey) return;
-  if (config.routeCacheConfig.enableL2 
+  if (config.routeCacheConfig.enableL2
     && r.uri.startsWith("/library/metadata")) {
     // async cachePreload
     cachePreload(r, urlUtil.getCurrentRequestUrlPrefix(r) + partKey, util.CHCHE_LEVEL_ENUM.L2);
@@ -770,7 +830,9 @@ async function redirect(r, url, cachedRouteDictKey) {
   r.headersOut["Access-Control-Allow-Origin"] = "*";
 
   if (config.alistSignEnable) {
+    const originalUrl = url;
     url = util.addAlistSign(url, config.alistToken, config.alistSignExpireTime);
+    r.warn(`addAlistSign: ${originalUrl} => ${url}`);
   }
   if (config.redirectCheckEnable && !(await util.cost(ngxExt.linkCheck, url, r.headersIn["User-Agent"]))) {
     r.warn(`redirectCheck fail: ${url}`);
@@ -778,6 +840,8 @@ async function redirect(r, url, cachedRouteDictKey) {
   }
 
   r.warn(`redirect to: ${url}`);
+  r.warn(`redirect request headers: ${JSON.stringify(r.headersIn)}`);
+  r.warn(`redirect request args: ${JSON.stringify(r.args)}`);
   // need caller: return;
   r.return(302, url);
 

@@ -30,6 +30,9 @@ export default {
   mediaMountPath,
   strHead: commonConfig.strHead,
 
+    msAddr: mountConfig.msAddr,
+    msApiKey: mountConfig.msApiKey,
+
   alistAddr: mountConfig.alistAddr,
   alistToken: mountConfig.alistToken,
   alistSignEnable: mountConfig.alistSignEnable,
