@@ -143,12 +143,28 @@ async function redirect2Pan(r) {
   }
 
   const fallbackUseOriginal = config.fallbackUseOriginal ?? true;
+  // 提前定义MS相关配置变量，避免重复访问（提前到这里，以便尽早使用）
+  const msAddr = config.msAddr;
+  const msPublicAddr = config.msPublicAddr;
+  const msApiKey = config.msApiKey;
+  
   // 获取Plex文件路径
   const itemInfo = await util.cost(getPlexItemInfo, r);
   let mediaServerRes;
   if (itemInfo.filePath) {
     mediaServerRes = { path: itemInfo.filePath };
     r.warn(`get filePath from cache partInfoDict`);
+    // 优化：如果缓存中的路径已经是 MS API URL，直接处理，跳过后续步骤
+    if (isMsApiUrl(itemInfo.filePath, msAddr, msPublicAddr)) {
+      r.warn(`cached filePath is MS API URL, processing directly`);
+      const redirectUrl = await fetchMsApiRedirect(r, itemInfo.filePath, ua, 15000);
+      if (redirectUrl) {
+        r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
+        return redirect(r, redirectUrl);
+      } else {
+        r.warn(`fetchMsApiRedirect failed, will continue with normal processing`);
+      }
+    }
   } else {
     r.warn(`itemInfoUri: ${itemInfo.itemInfoUri}`);
     mediaServerRes = await util.cost(fetchPlexFilePath,
@@ -179,6 +195,18 @@ async function redirect2Pan(r) {
     }
   }
 
+  // 优化：提前检查 MS API URL，如果是则跳过符号链接检查等后续步骤
+  if (isMsApiUrl(mediaServerRes.path, msAddr, msPublicAddr)) {
+    r.warn(`mediaServerRes.path is MS API URL, processing directly before symlink check`);
+    const redirectUrl = await fetchMsApiRedirect(r, mediaServerRes.path, ua, 15000);
+    if (redirectUrl) {
+      r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
+      return redirect(r, redirectUrl);
+    } else {
+      r.warn(`fetchMsApiRedirect failed, will continue with symlink check`);
+    }
+  }
+
   // 检查符号链接规则
   const symlinkRule = config.symlinkRule;
   if (symlinkRule && symlinkRule.length > 0) {
@@ -189,6 +217,15 @@ async function redirect2Pan(r) {
       if (realpath) {
         r.warn(`symlinkRule realpath overwrite pre: ${mediaServerRes.path}`);
         mediaServerRes.path = realpath;
+        // 优化：符号链接解析后，再次检查是否是 MS API URL
+        if (isMsApiUrl(realpath, msAddr, msPublicAddr)) {
+          r.warn(`symlink realpath is MS API URL, processing directly`);
+          const redirectUrl = await fetchMsApiRedirect(r, realpath, ua, 15000);
+          if (redirectUrl) {
+            r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
+            return redirect(r, redirectUrl);
+          }
+        }
       }
     }
   }
@@ -214,11 +251,6 @@ async function redirect2Pan(r) {
   ) {
     return blocked(r);
   }
-
-  // 提前定义MS相关配置变量，避免重复访问
-  const msAddr = config.msAddr;
-  const msPublicAddr = config.msPublicAddr;
-  const msApiKey = config.msApiKey;
   
   // strm支持处理
   if (notLocal) {
@@ -500,7 +532,9 @@ async function fetchAlistPathApi(alistApiPath, alistFilePath, alistToken, ua) {
 async function cachePreload(r, url, cacheLevel) {
   url = urlUtil.appendUrlArg(url, util.ARGS.cacheLevleKey, cacheLevel);
   ngx.log(ngx.WARN, `cachePreload Level: ${cacheLevel}`);
+  // 优化：立即返回，不等待 preload 完成，避免阻塞
   preload(r, url);
+  // 注意：preload 是异步的，这里不 await，让它后台执行
 }
 
 /**
@@ -730,38 +764,45 @@ function plexApiHandlerForJson(r, body) {
   mediaContainerHandler(r, mediaContainer);
   const directoryArr = mediaContainer.Directory;
   if (directoryArr) {
-    directoryArr.map(dir => {
-      directoryHandler(r, dir);
-    });
+    // 优化：使用 for 循环替代 map，性能更好
+    for (let i = 0; i < directoryArr.length; i++) {
+      directoryHandler(r, directoryArr[i]);
+    }
   }
   if (mediaContainer.size > 0) {
     let metadataArr = [];
     if (mediaContainer.Hub) {
-      mediaContainer.Hub.map(hub => {
+      // 优化：使用 for 循环替代 map，性能更好
+      for (let i = 0; i < mediaContainer.Hub.length; i++) {
+        const hub = mediaContainer.Hub[i];
         if (hub.Metadata) {
-          hub.Metadata.map(metadata => {
-            metadataArr.push(metadata);
-          });
+          for (let j = 0; j < hub.Metadata.length; j++) {
+            metadataArr.push(hub.Metadata[j]);
+          }
         }
-      });
+      }
     } else {
       if (mediaContainer.Metadata) {
-        mediaContainer.Metadata.map(metadata => {
-          metadataArr.push(metadata);
-        });
+        // 优化：直接使用数组，避免不必要的 push
+        metadataArr = mediaContainer.Metadata;
       }
     }
-    metadataArr.map(metadata => {
+    // 优化：使用 for 循环替代 map，性能更好
+    for (let i = 0; i < metadataArr.length; i++) {
+      const metadata = metadataArr[i];
       metadataHandler(r, metadata);
       if (metadata.Media) {
-        metadata.Media.map(media => {
+        for (let j = 0; j < metadata.Media.length; j++) {
+          const media = metadata.Media[j];
           mediaInfoHandler(r, media);
           if (media.Part) {
-            media.Part.map(part => partInfoHandler(r, part));
+            for (let k = 0; k < media.Part.length; k++) {
+              partInfoHandler(r, media.Part[k]);
+            }
           }
-        });
+        }
       }
-    });
+    }
   }
 }
 
@@ -775,29 +816,35 @@ function plexApiHandlerForXml(r, body) {
   mediaContainerHandler(r, mediaContainerXmlDoc, true);
   const directoryXmlDoc = mediaContainerXmlDoc.$tags$Directory;
   if (directoryXmlDoc) {
-    directoryXmlDoc.map(dir => {
-      directoryHandler(r, dir, true);
-    });
+    // 优化：使用 for 循环替代 map，性能更好
+    for (let i = 0; i < directoryXmlDoc.length; i++) {
+      directoryHandler(r, directoryXmlDoc[i], true);
+    }
   }
   let videoXmlNodeArr = mediaContainerXmlDoc.$tags$Video;
   let mediaXmlNodeArr;
   let partXmlNodeArr;
   // r.log(videoXmlNodeArr.length);
   if (videoXmlNodeArr && videoXmlNodeArr.length > 0) {
-    videoXmlNodeArr.map(video => {
+    // 优化：使用 for 循环替代 map，性能更好
+    for (let i = 0; i < videoXmlNodeArr.length; i++) {
+      const video = videoXmlNodeArr[i];
       metadataHandler(r, video, true);
       // Video.key禁止修改，客户端不支持
       mediaXmlNodeArr = video.$tags$Media;
       if (mediaXmlNodeArr && mediaXmlNodeArr.length > 0) {
-        mediaXmlNodeArr.map(media => {
+        for (let j = 0; j < mediaXmlNodeArr.length; j++) {
+          const media = mediaXmlNodeArr[j];
           mediaInfoHandler(r, media, true);
           partXmlNodeArr = media.$tags$Part;
           if (partXmlNodeArr && partXmlNodeArr.length > 0) {
-            partXmlNodeArr.map(part => partInfoHandler(r, part, true));
+            for (let k = 0; k < partXmlNodeArr.length; k++) {
+              partInfoHandler(r, partXmlNodeArr[k], true);
+            }
           }
-        });
+        }
       }
-    });
+    }
   }
 }
 
@@ -854,8 +901,16 @@ function routeCachePartInfo(r, partKey) {
   if (!partKey) return;
   if (config.routeCacheConfig.enableL2
     && r.uri.startsWith("/library/metadata")) {
-    // 异步缓存预加载
-    cachePreload(r, urlUtil.getCurrentRequestUrlPrefix(r) + partKey, util.CHCHE_LEVEL_ENUM.L2);
+    // 优化：立即执行预加载，不等待，避免阻塞主流程
+    // 使用立即执行的异步函数，确保不阻塞当前处理
+    (async function() {
+      try {
+        await cachePreload(r, urlUtil.getCurrentRequestUrlPrefix(r) + partKey, util.CHCHE_LEVEL_ENUM.L2);
+      } catch (error) {
+        // 静默处理错误，不影响主流程
+        r.log(`cachePreload error: ${error}`);
+      }
+    })();
   }
 }
 
