@@ -31,6 +31,7 @@ export default {
   strHead: commonConfig.strHead,
 
     msAddr: mountConfig.msAddr,
+    msPublicAddr: mountConfig.msPublicAddr,
     msApiKey: mountConfig.msApiKey,
 
   alistAddr: mountConfig.alistAddr,

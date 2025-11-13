@@ -22,6 +22,7 @@ const alistPublicAddr = "http://youralist.com:5244";
 
 // 新增配置：MS服务地址和API密钥
 const msAddr = "http://192.168.4.37:8888";
+const msPublicAddr = "http://yourms.com:4433";
 const msApiKey = "sk-bc007061a4974cdba18f5afc37f7ecef";
 
 // 指定客户端自己请求并获取 alist 直链的规则,代码优先级在 redirectStrmLastLinkRule 之后
@@ -52,6 +53,7 @@ const fallbackUseOriginal = true;
 
 export default {
     msAddr,
+    msPublicAddr,
     msApiKey,
 
   alistAddr,

@@ -10,12 +10,92 @@ import ngxExt from "./modules/ngx-ext.js";
 
 const xml = require("xml");
 
+/**
+ * 检查 URL 是否是 MS API URL
+ * @param {String} url - 要检查的 URL
+ * @param {String} msAddr - MS 服务地址
+ * @param {String} msPublicAddr - MS 公网地址
+ * @returns {Boolean} 是否是 MS API URL
+ */
+function isMsApiUrl(url, msAddr, msPublicAddr) {
+  if (!url) return false;
+  return (msAddr && url.startsWith(msAddr)) || (msPublicAddr && url.startsWith(msPublicAddr));
+}
+
+/**
+ * 处理 MS API URL 请求，获取重定向链接
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {String} url - MS API URL
+ * @param {String} ua - User-Agent
+ * @param {Number} timeout - 超时时间（毫秒），默认 15000
+ * @returns {Promise<String|null>} 重定向链接，失败返回 null
+ */
+async function fetchMsApiRedirect(r, url, ua, timeout) {
+  // NJS 不支持默认参数，在函数内部处理
+  if (timeout === undefined || timeout === null) {
+    timeout = 15000;
+  }
+  r.warn(`fetchMsApiRedirect: requesting ${url}, timeout: ${timeout}ms`);
+  try {
+    const response = await ngx.fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": ua,
+      },
+      max_response_body_size: 65535,
+      timeout: timeout
+    });
+    
+    r.warn(`fetchMsApiRedirect: response status: ${response.status}`);
+    
+    // 处理302/301重定向响应，获取Location头中的URL
+    if (response.status === 302 || response.status === 301) {
+      const location = response.headers["Location"];
+      if (location) {
+        r.warn(`MS API returned redirect to: ${location}`);
+        return location;
+      } else {
+        r.warn(`MS API returned ${response.status} without Location header`);
+        return null;
+      }
+    } else if (response.ok) {
+      // 处理 JSON 响应（用于 strm302 API）
+      try {
+        const result = await response.json();
+        r.warn(`fetchMsApiRedirect: JSON response: ${JSON.stringify(result)}`);
+        if (result && result.url) {
+          r.warn(`MS API returned URL from JSON: ${result.url}`);
+          return result.url;
+        } else {
+          r.warn(`MS API JSON response missing url field`);
+          return null;
+        }
+      } catch (jsonError) {
+        r.error(`MS API JSON parse failed: ${jsonError}`);
+        return null;
+      }
+    } else {
+      r.warn(`MS API returned status ${response.status}, not 200/301/302`);
+      return null;
+    }
+  } catch (error) {
+    r.error(`MS API request failed: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * 主函数：处理Plex重定向到直链
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ */
 async function redirect2Pan(r) {
+  // 优化：减少日志输出，仅在调试时启用
   events.njsOnExit(`redirect2Pan: ${r.uri}`);
   // r.warn(`redirect2Pan headersIn: ${JSON.stringify(r.headersIn)}`);
   // r.warn(`redirect2Pan args: ${JSON.stringify(r.args)}`);
   // r.warn(`redirect2Pan remote_addr: ${r.variables.remote_addr}`);
 
+  // 检查是否允许重定向
   if (!allowRedirect(r)) {
     return internalRedirect(r);
   }
@@ -23,7 +103,7 @@ async function redirect2Pan(r) {
   const ua = r.headersIn["User-Agent"];
   r.warn(`redirect2Pan, UA: ${ua}`);
 
-  // check transcode
+  // 检查转码设置
   if (config.transcodeConfig.enable
     && r.uri.toLowerCase().includes("/transcode/universal/start")
     && r.args.directPlay === "0") {
@@ -31,37 +111,39 @@ async function redirect2Pan(r) {
     return internalRedirect(r);
   }
 
-  // check route cache
+  // 检查路由缓存
   const routeCacheConfig = config.routeCacheConfig;
-  if (routeCacheConfig.enable) {
+  if (routeCacheConfig && routeCacheConfig.enable) {
     // webClient download only have itemId on pathParam
     let cacheKey = util.parseExpression(r, routeCacheConfig.keyExpression) ?? r.uri;
     r.log(`redirect2Pan routeCacheKey: ${cacheKey}`);
-    let routeDictKey;
-    let cachedLink;
+    // 优化：提前检查是否需要 UA 隔离
+    const domainArr115 = config.strHead["115"];
+    const needUaIsolation = Array.isArray(domainArr115) 
+      ? domainArr115.some(d => cacheKey.includes(d)) 
+      : (domainArr115 && cacheKey.includes(domainArr115));
+    
     for (let index = 1; index < 3; index++) {
-      routeDictKey = `routeL${index}Dict`;
-      cachedLink = ngx.shared[routeDictKey].get(cacheKey);
-      if (!cachedLink) {
-        // 115 must use ua
+      const routeDictKey = `routeL${index}Dict`;
+      let cachedLink = ngx.shared[routeDictKey].get(cacheKey);
+      if (!cachedLink && needUaIsolation) {
+        // 115必须使用UA区分缓存
         cachedLink = ngx.shared[routeDictKey].get(`${cacheKey}:${ua}`);
       }
       if (cachedLink) {
         r.warn(`hit cache ${routeDictKey}: ${cachedLink}`);
         if (cachedLink.startsWith("@")) {
-          // use original link
+          // 使用原始链接
           return internalRedirect(r, cachedLink, routeDictKey);
         } else {
           return redirect(r, cachedLink, routeDictKey);
         }
-      } else {
-        r.log(`not found from cache ${routeDictKey}, skip`);
       }
     }
   }
 
   const fallbackUseOriginal = config.fallbackUseOriginal ?? true;
-  // fetch mount plex file path
+  // 获取Plex文件路径
   const itemInfo = await util.cost(getPlexItemInfo, r);
   let mediaServerRes;
   if (itemInfo.filePath) {
@@ -87,16 +169,17 @@ async function redirect2Pan(r) {
   if (notLocal) {
     const filePathPart = urlUtil.getFilePathPart(mediaServerRes.path);
     if (filePathPart) {
-      // need careful encode filePathPart, other don't encode
+      // 需要小心处理filePathPart的编码，其他部分不要编码
       r.warn(`is CloudDrive/AList link, decodeURIComponent filePathPart before: ${mediaServerRes.path}`);
       mediaServerRes.path = mediaServerRes.path.replace(filePathPart, decodeURIComponent(filePathPart));
     } else {
-      r.warn(`not is CloudDrive/AList link, decodeURIComponent filePath before: ${mediaServerRes.path}`);
+      // 优化：减少不必要的日志
+      // r.warn(`not is CloudDrive/AList link, decodeURIComponent filePath before: ${mediaServerRes.path}`);
       mediaServerRes.path = decodeURIComponent(mediaServerRes.path);
     }
   }
 
-  // check symlinkRule
+  // 检查符号链接规则
   const symlinkRule = config.symlinkRule;
   if (symlinkRule && symlinkRule.length > 0) {
     const hitRule = symlinkRule.find(rule => util.strMatches(rule[0], mediaServerRes.path, rule[1]));
@@ -111,40 +194,68 @@ async function redirect2Pan(r) {
   }
   r.warn(`mount plex file path: ${mediaServerRes.path}`);
 
-  // add Expression Context to r
-  // because plex PartInfo cache only has path, not implemented temporarily
+  // 添加表达式上下文到r对象
+  // 因为Plex PartInfo缓存只有路径，暂时未实现
   r[util.ARGS.rXMediaKey] = mediaServerRes.media;
-  ngx.log(ngx.WARN, `add plex Media to r`);
-  // routeRule, not must before mediaPathMapping, before is simple, can ignore mediaPathMapping
+  // 优化：减少不必要的日志
+  // ngx.log(ngx.WARN, `add plex Media to r`);
+  // 路由规则处理，不必在mediaPathMapping之前，之前处理更简单，可以忽略mediaPathMapping
   const routeMode = util.getRouteMode(r, mediaServerRes.path, false, notLocal);
   const apiType = r.variables.apiType ?? "";
-  r.warn(`getRouteMode: ${routeMode}, apiType: ${apiType}`);
+  // 优化：仅在调试时输出
+  // r.warn(`getRouteMode: ${routeMode}, apiType: ${apiType}`);
   if (util.ROUTE_ENUM.proxy === routeMode) {
-    return internalRedirect(r); // use original link
+    return internalRedirect(r); // 使用原始链接
   } else if ((routeMode === util.ROUTE_ENUM.block)
     || (routeMode === util.ROUTE_ENUM.blockDownload && apiType.endsWith("Download"))
     || (routeMode === util.ROUTE_ENUM.blockPlay && apiType.endsWith("Play"))
-    // Infuse use VideoStreamPlay to download, UA diff, ignore apiType
+    // Infuse使用VideoStreamPlay下载，UA不同，忽略apiType
     || (routeMode === util.ROUTE_ENUM.blockDownload && ua.includes("Infuse"))
   ) {
     return blocked(r);
   }
 
-  // strm support
+  // 提前定义MS相关配置变量，避免重复访问
+  const msAddr = config.msAddr;
+  const msPublicAddr = config.msPublicAddr;
+  const msApiKey = config.msApiKey;
+  
+  // strm支持处理
   if (notLocal) {
     const strmInnerText = await util.cost(fetchStrmInnerText, r);
     r.warn(`fetchStrmInnerText cover mount plex file path: ${strmInnerText}`);
     mediaServerRes.path = strmInnerText;
+    
+    // 如果STRM文件内容已经是MS API的URL，直接处理它
+    if (isMsApiUrl(strmInnerText, msAddr, msPublicAddr)) {
+      r.warn(`STRM content is already MS API URL, processing directly`);
+      const redirectUrl = await fetchMsApiRedirect(r, strmInnerText, ua, 15000);
+      if (redirectUrl) {
+        r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
+        return redirect(r, redirectUrl);
+      } else {
+        r.warn(`fetchMsApiRedirect failed or returned null, will continue with original MS API URL`);
+        // 如果请求失败，继续后续处理，但不要再次处理 MS API URL
+        // 设置一个标记，避免后续重复处理
+        mediaServerRes.path = strmInnerText;
+        mediaServerRes.skipMsApiCheck = true;
+      }
+    }
   }
 
-  // file path mapping
-  const mediaPathMapping = config.mediaPathMapping.slice(); // warnning config.XX Objects is current VM shared variable
-  config.mediaMountPath.filter(s => s).map(s => mediaPathMapping.unshift([0, 0, s, ""]));
+  // 文件路径映射
+  const mediaPathMapping = config.mediaPathMapping.slice(); // 警告：config.XX对象是当前VM共享变量
+  // 优化：使用 forEach 替代 map，因为我们不需要返回值
+  const mountPaths = config.mediaMountPath.filter(s => s);
+  for (let i = mountPaths.length - 1; i >= 0; i--) {
+    mediaPathMapping.unshift([0, 0, mountPaths[i], ""]);
+  }
   let mediaItemPath = util.doUrlMapping(r, mediaServerRes.path, notLocal, mediaPathMapping, "mediaPathMapping");
-  ngx.log(ngx.WARN, `mapped plex file path: ${mediaItemPath}`);
+  // 优化：减少不必要的日志
+  // ngx.log(ngx.WARN, `mapped plex file path: ${mediaItemPath}`);
 
-  // strm file inner remote link redirect,like: http,rtsp
-  // not only strm, mediaPathMapping maybe used remote link
+  // strm文件内部远程链接重定向，如：http,rtsp
+  // 不仅strm，mediaPathMapping可能使用远程链接
   const isRelative = !util.isAbsolutePath(mediaItemPath);
   if (isRelative) {
     let rule = util.simpleRuleFilter(
@@ -167,7 +278,7 @@ async function redirect2Pan(r) {
         }
       }
     }
-    // need careful encode filePathPart, other don't encode
+    // 需要小心处理filePathPart的编码，其他部分不要编码
     const filePathPart = urlUtil.getFilePathPart(mediaItemPath);
     if (filePathPart) {
       r.warn(`is CloudDrive/AList link, encodeURIComponent filePathPart before: ${mediaItemPath}`);
@@ -176,15 +287,26 @@ async function redirect2Pan(r) {
     return redirect(r, mediaItemPath);
   }
 
-  // clientSelfAlistRule, before fetch alist
+  // 如果是MS API URL且不是STRM文件，直接处理
+  // 但跳过已经在 STRM 处理中失败的情况
+  if (!mediaServerRes.skipMsApiCheck && isMsApiUrl(mediaItemPath, msAddr, msPublicAddr)) {
+    r.warn(`Direct processing of MS API URL: ${mediaItemPath}`);
+    const redirectUrl = await fetchMsApiRedirect(r, mediaItemPath, ua, 15000);
+    if (redirectUrl) {
+      r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
+      return redirect(r, redirectUrl);
+    } else {
+      r.warn(`fetchMsApiRedirect failed for direct MS API URL, will fallback to original URL`);
+    }
+  }
+
+  // 客户端自定义AList规则，在获取AList之前
   const alistDUrl = util.getClientSelfAlistLink(r, mediaItemPath);
   if (alistDUrl) { return redirect(r, alistDUrl); }
 
-  // fetch alist direct link
+  // 获取AList直链
   const alistToken = config.alistToken;
   const alistAddr = config.alistAddr;
-  const msAddr = config.msAddr;
-  const msApiKey = config.msApiKey;
   const alistFilePath = mediaItemPath;
   const alistFsGetApiPath = `${alistAddr}/api/fs/get`;
   
@@ -194,44 +316,12 @@ async function redirect2Pan(r) {
   if (msAddr && msApiKey) {
     const msApiPath = `${msAddr}/api/v1/cloudStorage/strm302?apiKey=${msApiKey}&path=${encodeURIComponent(alistFilePath)}`;
     r.warn(`fetching direct link from MS API: ${msApiPath}`);
-    try {
-      const response = await ngx.fetch(msApiPath, {
-        method: "GET",
-        headers: {
-          "User-Agent": ua,
-        },
-        max_response_body_size: 65535
-      });
-      
-      r.warn(`MS API response status: ${response.status}`);
-      r.warn(`MS API response headers: ${JSON.stringify(response.headers)}`);
-      // r.warn(`MS API response: ${JSON.stringify(response)}`);
-      
-      // 处理302重定向响应，获取Location头中的URL
-      if (response.status === 302 || response.status === 301) {
-        const location = response.headers["Location"];
-        if (location) {
-          r.warn(`MS API returned redirect to: ${location}`);
-          alistRes = location;
-          isUsingMsApi = true;
-        } else {
-          alistRes = `error: MS API returned ${response.status} without Location header`;
-        }
-      } else if (response.ok) {
-        const result = await response.json();
-        r.warn(`MS API response body: ${JSON.stringify(result)}`);
-        if (result && result.url) {
-          alistRes = result.url;
-          isUsingMsApi = true;
-        } else {
-          alistRes = `error: MS API returned invalid response`;
-        }
-      } else {
-        alistRes = `error: MS API returned status ${response.status}`;
-      }
-    } catch (error) {
-      r.error(`MS API request failed: ${error}`);
-      alistRes = `error: MS API request failed ${error}`;
+    const redirectUrl = await fetchMsApiRedirect(r, msApiPath, ua, 15000);
+    if (redirectUrl) {
+      alistRes = redirectUrl;
+      isUsingMsApi = true;
+    } else {
+      alistRes = `error: MS API request failed or invalid response`;
     }
   } else {
     // 回退到原来的逻辑
@@ -244,26 +334,28 @@ async function redirect2Pan(r) {
     );
   }
   
-  r.warn(`fetchAlistPathApi, UA: ${ua}`);
-  r.warn(`fetchAlistPathApi result: ${alistRes}`);
+  // 优化：减少不必要的日志
+  // r.warn(`fetchAlistPathApi, UA: ${ua}`);
+  // r.warn(`fetchAlistPathApi result: ${alistRes}`);
   if (!alistRes.startsWith("error")) {
-    // routeRule, there is only check for alistRes on proxy mode
-    r.warn(`checking route mode for alistRes: ${alistRes}`);
+    // 路由规则，代理模式下只检查alistRes
+    // r.warn(`checking route mode for alistRes: ${alistRes}`);
     const routeMode = util.getRouteMode(r, alistRes, true, notLocal);
-    r.warn(`routeMode result: ${routeMode}`);
+    // r.warn(`routeMode result: ${routeMode}`);
     if (util.ROUTE_ENUM.proxy === routeMode) {
-      return internalRedirect(r); // use original link
+      return internalRedirect(r); // 使用原始链接
     }
-    // clientSelfAlistRule, after fetch alist, cover raw_url
+    // 客户端自定义AList规则，在获取AList之后，覆盖raw_url
     // 如果是使用MS API获取的链接，则跳过clientSelfAlistRule处理
     let redirectUrl = isUsingMsApi ? alistRes : (util.getClientSelfAlistLink(r, alistRes, alistFilePath) ?? alistRes);
-    r.warn(`getClientSelfAlistLink result: ${redirectUrl}`);
+    // r.warn(`getClientSelfAlistLink result: ${redirectUrl}`);
     const key = "alistRawUrlMapping";
     if (config[key] && config[key].length > 0) {
       const mappedUrl = util.doUrlMapping(r, redirectUrl, notLocal, config[key], key);
       if (mappedUrl) {
         redirectUrl = mappedUrl;
-        ngx.log(ngx.WARN, `${key} mapped: ${redirectUrl}`);
+        // 优化：减少不必要的日志
+        // ngx.log(ngx.WARN, `${key} mapped: ${redirectUrl}`);
       }
     }
     return redirect(r, redirectUrl);
@@ -313,6 +405,11 @@ async function redirect2Pan(r) {
   return fallbackUseOriginal ? internalRedirect(r) : r.return(500, alistRes);
 }
 
+/**
+ * 检查是否允许重定向
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @returns {Boolean} 是否允许重定向
+ */
 function allowRedirect(r) {
   const redirectConfig = config.redirectConfig;
   if (!redirectConfig) {
@@ -335,6 +432,14 @@ function allowRedirect(r) {
   });
 }
 
+/**
+ * 从AList获取路径API
+ * @param {String} alistApiPath - AList API路径
+ * @param {String} alistFilePath - 文件路径
+ * @param {String} alistToken - AList令牌
+ * @param {String} ua - User-Agent
+ * @returns {Promise<String>} AList响应结果
+ */
 // copy from emby2Alist/nginx/conf.d/emby.js
 async function fetchAlistPathApi(alistApiPath, alistFilePath, alistToken, ua) {
   const alistRequestBody = {
@@ -354,6 +459,7 @@ async function fetchAlistPathApi(alistApiPath, alistFilePath, alistToken, ua) {
         Host: hostValue,
       },
       max_response_body_size: 65535,
+      timeout: 15000, // 15秒超时
       body: JSON.stringify(alistRequestBody),
     });
     if (response.ok) {
@@ -385,14 +491,26 @@ async function fetchAlistPathApi(alistApiPath, alistFilePath, alistToken, ua) {
   }
 }
 
+/**
+ * 缓存预加载
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {String} url - 预加载URL
+ * @param {String} cacheLevel - 缓存级别
+ */
 async function cachePreload(r, url, cacheLevel) {
   url = urlUtil.appendUrlArg(url, util.ARGS.cacheLevleKey, cacheLevel);
   ngx.log(ngx.WARN, `cachePreload Level: ${cacheLevel}`);
   preload(r, url);
 }
 
+/**
+ * 预加载函数
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {String} url - 预加载URL
+ */
 async function preload(r, url) {
-  events.njsOnExit(`preload`);
+  // 优化：减少日志输出，仅在调试时启用
+  // events.njsOnExit(`preload`);
 
   url = urlUtil.appendUrlArg(url, util.ARGS.internalKey, "1");
   const ua = r.headersIn["User-Agent"];
@@ -414,8 +532,15 @@ async function preload(r, url) {
   });
 }
 
-// plex only
+// plex专用函数
 
+/**
+ * 从Plex获取文件路径
+ * @param {String} itemInfoUri - 项目信息URI
+ * @param {Number} mediaIndex - 媒体索引
+ * @param {Number} partIndex - 部分索引
+ * @returns {Promise<Object>} 媒体服务器响应结果
+ */
 async function fetchPlexFilePath(itemInfoUri, mediaIndex, partIndex) {
   let rvt = {
     message: "success",
@@ -426,11 +551,12 @@ async function fetchPlexFilePath(itemInfoUri, mediaIndex, partIndex) {
     const res = await ngx.fetch(itemInfoUri, {
       method: "GET",
       headers: {
-      	"Accept": "application/json", // only plex need this
+      	"Accept": "application/json", // 只有Plex需要这个
         "Content-Type": "application/json;charset=utf-8",
         "Content-Length": 0,
       },
-      max_response_body_size: 65535
+      max_response_body_size: 65535,
+      timeout: 120000 // 120秒超时
     });
     if (res.ok) {
       const result = await res.json();
@@ -442,7 +568,7 @@ async function fetchPlexFilePath(itemInfoUri, mediaIndex, partIndex) {
         rvt.message = `error: plex_api not found search results`;
         return rvt;
       }
-      // location ~* /library/parts/(\d+)/(\d+)/file, not hava mediaIndex and partIndex
+      // location ~* /library/parts/(\d+)/(\d+)/file, 没有mediaIndex和partIndex
       mediaIndex = mediaIndex ? mediaIndex : 0;
       partIndex = partIndex ? partIndex : 0;
       const media = result.MediaContainer.Metadata[0].Media[mediaIndex];
@@ -459,6 +585,11 @@ async function fetchPlexFilePath(itemInfoUri, mediaIndex, partIndex) {
   }
 }
 
+/**
+ * 获取Plex项目信息
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @returns {Object} Plex项目信息
+ */
 async function getPlexItemInfo(r) {
   const plexHost = config.plexHost;
   const path = r.args.path;
@@ -468,10 +599,10 @@ async function getPlexItemInfo(r) {
   let filePath;
   let itemInfoUri = "";
   if (path) {
-	  // see: location ~* /video/:/transcode/universal/start
+	  // 参见：location ~* /video/:/transcode/universal/start
   	itemInfoUri = `${plexHost}${path}?${util.ARGS.plexTokenKey}=${api_key}`;
   } else {
-  	// see: location ~* /library/parts/(\d+)/(\d+)/file
+  	// 参见：location ~* /library/parts/(\d+)/(\d+)/file
     filePath = ngx.shared.partInfoDict.get(r.uri);
     r.warn(`getPlexItemInfo r.uri: ${r.uri}`);
     if (!filePath) {
@@ -488,6 +619,11 @@ async function getPlexItemInfo(r) {
   return { filePath, itemInfoUri, mediaIndex, partIndex, api_key };
 }
 
+/**
+ * 获取Plex文件全名
+ * @param {String} downloadApiPath - 下载API路径
+ * @returns {Promise<String>} Plex文件全名或错误信息
+ */
 async function fetchPlexFileFullName(downloadApiPath) {
   try {
     const response = await ngx.fetch(downloadApiPath, {
@@ -504,24 +640,30 @@ async function fetchPlexFileFullName(downloadApiPath) {
   }
 }
 
+/**
+ * 获取STRM内部文本
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @returns {Promise<String>} STRM内部文本或错误信息
+ */
 async function fetchStrmInnerText(r) {
   const plexHost = config.plexHost;
   const api_key = r.args[util.ARGS.plexTokenKey] || r.headersIn[util.ARGS.plexTokenKey];
   const downloadApiPath = `${plexHost}${r.uri}?download=1&${util.ARGS.plexTokenKey}=${api_key}`;
   try {
-  	// fetch Api ignore nginx locations
+  	// fetch Api忽略nginx位置
     const response = await ngx.fetch(downloadApiPath, {
       method: "HEAD",
-      max_response_body_size: 1024
+      max_response_body_size: 1024,
+      timeout: 30000 // 30秒超时
     });
-    // plex strm downloadApi self return 301, response.redirected api error return false
+    // plex strm downloadApi自己返回301，response.redirected api错误返回false
     if (response.status > 300 && response.status < 309) {
       const location = response.headers["Location"];
       let strmInnerText = location;
       const tmpArr = plexHost.split(":");
       const plexHostWithoutPort = `${tmpArr[0]}:${tmpArr[1]}`;
       if (location.startsWith(plexHostWithoutPort)) {
-        // strmInnerText is local path
+        // strmInnerText是本地路径
         strmInnerText = location.replace(plexHostWithoutPort, "");
       }
       r.log(`fetchStrmInnerText: ${strmInnerText}`);
@@ -538,12 +680,17 @@ async function fetchStrmInnerText(r) {
   }
 }
 
+/**
+ * Plex API处理器
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ */
 async function plexApiHandler(r) {
-  events.njsOnExit(`plexApiHandler: ${r.uri}`);
+  // 优化：减少日志输出，仅在调试时启用
+  // events.njsOnExit(`plexApiHandler: ${r.uri}`);
 
   const apiType = r.variables.apiType ?? "";
   if (!config.transcodeConfig.enable && apiType === "TranscodeUniversalDecision") {
-    // default modify direct play supports all true
+    // 默认修改直接播放支持所有为true
     r.variables.request_uri += "&directPlay=1&directStream=1";
     r.headersOut["X-Modify-DirectPlay-Success"] = true;
   }
@@ -573,6 +720,11 @@ async function plexApiHandler(r) {
   return r.return(200, sBody);
 }
 
+/**
+ * Plex API JSON处理器
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {Object} body - 响应体
+ */
 function plexApiHandlerForJson(r, body) {
   const mediaContainer = body.MediaContainer;
   mediaContainerHandler(r, mediaContainer);
@@ -613,6 +765,11 @@ function plexApiHandlerForJson(r, body) {
   }
 }
 
+/**
+ * Plex API XML处理器
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {Object} body - 响应体
+ */
 function plexApiHandlerForXml(r, body) {
   const mediaContainerXmlDoc = body.MediaContainer;
   mediaContainerHandler(r, mediaContainerXmlDoc, true);
@@ -629,7 +786,7 @@ function plexApiHandlerForXml(r, body) {
   if (videoXmlNodeArr && videoXmlNodeArr.length > 0) {
     videoXmlNodeArr.map(video => {
       metadataHandler(r, video, true);
-      // Video.key prohibit modify, clients not supported
+      // Video.key禁止修改，客户端不支持
       mediaXmlNodeArr = video.$tags$Media;
       if (mediaXmlNodeArr && mediaXmlNodeArr.length > 0) {
         mediaXmlNodeArr.map(media => {
@@ -645,43 +802,43 @@ function plexApiHandlerForXml(r, body) {
 }
 
 /**
- * handler design patterns,below root to child order
- * @param {Object} r nginx objects, HTTP Request
- * @param {Object} mainObject different single object
- * @param {Boolean} isXmlNode mainObject is xml node
+ * 处理器设计模式，从根到子的顺序
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {Object} mainObject - 不同的单个对象
+ * @param {Boolean} isXmlNode - mainObject是否为xml节点
  */
 
 function mediaContainerHandler(r, mediaContainer, isXmlNode) {
-  // another custome process
+  // 其他自定义处理
 }
 
 function directoryHandler(r, directory, isXmlNode) {
   // modifyDirectoryHidden(r, directory, isXmlNode);
-  // another custome process
+  // 其他自定义处理
 }
 
 function metadataHandler(r, metadata, isXmlNode) {
-  // Metadata.key prohibit modify, clients not supported
-  // json is metadata, xml is $tags$Video tag
-  // another custome process
+  // Metadata.key禁止修改，客户端不支持
+  // json是metadata，xml是$tags$Video标签
+  // 其他自定义处理
 }
 
 function mediaInfoHandler(r, media, isXmlNode) {
   fillMediaInfo(r, media, isXmlNode);
-  // another custome process
+  // 其他自定义处理
 }
 
 function partInfoHandler(r, part, isXmlNode) {
   cachePartInfo(r, part, isXmlNode);
   fillPartInfo(r, part, isXmlNode);
-  // another custome process
+  // 其他自定义处理
 }
 
-// another custome process
+// 其他自定义处理
 
 function cachePartInfo(r, part, isXmlNode) {
   if (!part) return;
-  // Part.key can modify, but some clients not supported
+  // Part.key可以修改，但某些客户端不支持
   // partKey += `?${util.filePathKey}=${partFilePath}`;
   let partKey = part.key;
   let partFilePath = part.file;
@@ -697,15 +854,15 @@ function routeCachePartInfo(r, partKey) {
   if (!partKey) return;
   if (config.routeCacheConfig.enableL2
     && r.uri.startsWith("/library/metadata")) {
-    // async cachePreload
+    // 异步缓存预加载
     cachePreload(r, urlUtil.getCurrentRequestUrlPrefix(r) + partKey, util.CHCHE_LEVEL_ENUM.L2);
   }
 }
 
 function fillMediaInfo(r, media, isXmlNode) {
   if (!media) return;
-  // only strm file not have mediaContainer
-  // no real container required can playback, but subtitles maybe error
+  // 只有strm文件没有mediaContainer
+  // 没有真正的容器也可以播放，但字幕可能出错
   const defaultContainer = "mp4";
   if (isXmlNode) {
     if (!media.$attr$container) {
@@ -720,8 +877,8 @@ function fillMediaInfo(r, media, isXmlNode) {
 
 function fillPartInfo(r, part, isXmlNode) {
   if (!part) return;
-  // only strm file not have mediaContainer
-  // no real container required can playback, but subtitles maybe error
+  // 只有strm文件没有mediaContainer
+  // 没有真正的容器也可以播放，但字幕可能出错
   const defaultContainer = "mp4";
   const defaultStream = [];
   const isInfuse = r.headersIn["User-Agent"].includes("Infuse");
@@ -763,7 +920,7 @@ function modifyDirectoryHidden(r, dir, isXmlNode) {
   r.warn(`${dir.title}, modify hidden 2 => 0`);
 }
 
-// js_header_filter directive for debug test
+// js_header_filter指令用于调试测试
 // function libraryStreams(r) {
 //   events.njsOnExit(`libraryStreams: ${r.uri}`);
 
@@ -776,20 +933,26 @@ function modifyDirectoryHidden(r, dir, isXmlNode) {
 //   r.warn(`libraryStreams headersOut: ${JSON.stringify(r.headersOut)}`);
 // }
 
+/**
+ * 重定向后处理
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {String} url - 重定向URL
+ * @param {String} cachedRouteDictKey - 缓存路由字典键
+ */
 async function redirectAfter(r, url, cachedRouteDictKey) {
   try {
-    await new Promise(resolve => setTimeout(resolve, 0));
+    // 优化：移除不必要的延迟，直接执行缓存操作
     let cachedMsg = "";
     const routeCacheConfig = config.routeCacheConfig;
     if (routeCacheConfig.enable) {
       const ua = r.headersIn["User-Agent"];
-      // webClient download only have itemId on pathParam
+      // webClient下载只有itemId在pathParam中
       let cacheKey = util.parseExpression(r, routeCacheConfig.keyExpression) ?? r.uri;
       const domainArr115 = config.strHead["115"];
       const uaIsolation = Array.isArray(domainArr115) ? domainArr115.some(d => url.includes(d)) : url.includes(domainArr115);
       cacheKey = uaIsolation ? `${cacheKey}:${ua}` : cacheKey;
       r.log(`redirectAfter cacheKey: ${cacheKey}`);
-      // cachePreload added args in url
+      // cachePreload在URL中添加了参数
       const cacheLevle = r.args[util.ARGS.cacheLevleKey] ?? util.CHCHE_LEVEL_ENUM.L1;
       let flag = !ngx.shared["routeL2Dict"].has(cacheKey);
         // && !ngx.shared["routeL3Dict"].has(cacheKey);
@@ -812,6 +975,12 @@ async function redirectAfter(r, url, cachedRouteDictKey) {
   }
 }
 
+/**
+ * 内部重定向后处理
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {String} uri - 重定向URI
+ * @param {String} cachedRouteDictKey - 缓存路由字典键
+ */
 async function internalRedirectAfter(r, uri, cachedRouteDictKey) {
   try {
     const routeCacheConfig = config.routeCacheConfig;
@@ -824,8 +993,14 @@ async function internalRedirectAfter(r, uri, cachedRouteDictKey) {
   }
 }
 
+/**
+ * 重定向函数
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {String} url - 重定向URL
+ * @param {String} cachedRouteDictKey - 缓存路由字典键
+ */
 async function redirect(r, url, cachedRouteDictKey) {
-  // for strm, only plex need this, like part location, but conf don't use add_header, repetitive: "null *"
+  // 对于strm，只有Plex需要这个，如part位置，但配置不使用add_header，重复的："null *"
   // add_header Access-Control-Allow-Origin *;
   r.headersOut["Access-Control-Allow-Origin"] = "*";
 
@@ -840,38 +1015,54 @@ async function redirect(r, url, cachedRouteDictKey) {
   }
 
   r.warn(`redirect to: ${url}`);
-  r.warn(`redirect request headers: ${JSON.stringify(r.headersIn)}`);
-  r.warn(`redirect request args: ${JSON.stringify(r.args)}`);
-  // need caller: return;
+  // 优化：减少不必要的日志输出，仅在调试时启用
+  // r.warn(`redirect request headers: ${JSON.stringify(r.headersIn)}`);
+  // r.warn(`redirect request args: ${JSON.stringify(r.args)}`);
+  // 需要调用者：return;
   r.return(302, url);
 
-  // async
+  // 异步
   redirectAfter(r, url, cachedRouteDictKey);
 }
 
+/**
+ * 内部重定向函数
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {String} uri - 重定向URI
+ * @param {String} cachedRouteDictKey - 缓存路由字典键
+ */
 function internalRedirect(r, uri, cachedRouteDictKey) {
   if (!uri) {
     uri = "@root";
     r.warn(`use original link`);
   }
   r.log(`internalRedirect to: ${uri}`);
-  // need caller: return;
+  // 需要调用者：return;
   r.internalRedirect(uri);
 
-  // async
+  // 异步
   internalRedirectAfter(r, uri, cachedRouteDictKey);
 }
 
+/**
+ * 内部重定向期望函数
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ * @param {String} uri - 重定向URI
+ */
 function internalRedirectExpect(r, uri) {
   if (!uri) { uri = "@root"; }
   r.log(`internalRedirect to: ${uri}`);
-  // need caller: return;
+  // 需要调用者：return;
   r.internalRedirect(uri);
 }
 
+/**
+ * 屏蔽后处理
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ */
 async function blockedAfter(r) {
   try {
-    await new Promise(resolve => setTimeout(resolve, 0));
+    // 优化：移除不必要的延迟，直接执行日志记录
     const xMedia = r[util.ARGS.rXMediaKey];
     const msg = [
       "blocked",
@@ -887,10 +1078,14 @@ async function blockedAfter(r) {
   }
 }
 
+/**
+ * 屏蔽函数
+ * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
+ */
 function blocked(r) {
-  // need caller: return;
+  // 需要调用者：return;
   r.return(403, "blocked");
-  // async
+  // 异步
   blockedAfter(r);
 }
 
