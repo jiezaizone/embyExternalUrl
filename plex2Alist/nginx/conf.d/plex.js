@@ -33,7 +33,7 @@ function isMsApiUrl(url, msAddr, msPublicAddr) {
 async function fetchMsApiRedirect(r, url, ua, timeout) {
   // NJS 不支持默认参数，在函数内部处理
   if (timeout === undefined || timeout === null) {
-    timeout = 15000;
+    timeout = 30000;
   }
   r.warn(`fetchMsApiRedirect: requesting ${url}, timeout: ${timeout}ms`);
   try {
@@ -154,17 +154,6 @@ async function redirect2Pan(r) {
   if (itemInfo.filePath) {
     mediaServerRes = { path: itemInfo.filePath };
     r.warn(`get filePath from cache partInfoDict`);
-    // 优化：如果缓存中的路径已经是 MS API URL，直接处理，跳过后续步骤
-    if (isMsApiUrl(itemInfo.filePath, msAddr, msPublicAddr)) {
-      r.warn(`cached filePath is MS API URL, processing directly`);
-      const redirectUrl = await fetchMsApiRedirect(r, itemInfo.filePath, ua, 15000);
-      if (redirectUrl) {
-        r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
-        return redirect(r, redirectUrl);
-      } else {
-        r.warn(`fetchMsApiRedirect failed, will continue with normal processing`);
-      }
-    }
   } else {
     r.warn(`itemInfoUri: ${itemInfo.itemInfoUri}`);
     mediaServerRes = await util.cost(fetchPlexFilePath,
@@ -217,15 +206,6 @@ async function redirect2Pan(r) {
       if (realpath) {
         r.warn(`symlinkRule realpath overwrite pre: ${mediaServerRes.path}`);
         mediaServerRes.path = realpath;
-        // 优化：符号链接解析后，再次检查是否是 MS API URL
-        if (isMsApiUrl(realpath, msAddr, msPublicAddr)) {
-          r.warn(`symlink realpath is MS API URL, processing directly`);
-          const redirectUrl = await fetchMsApiRedirect(r, realpath, ua, 15000);
-          if (redirectUrl) {
-            r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
-            return redirect(r, redirectUrl);
-          }
-        }
       }
     }
   }
@@ -590,7 +570,7 @@ async function fetchPlexFilePath(itemInfoUri, mediaIndex, partIndex) {
         "Content-Length": 0,
       },
       max_response_body_size: 65535,
-      timeout: 120000 // 120秒超时
+      timeout: 180000 // 180秒超时
     });
     if (res.ok) {
       const result = await res.json();
