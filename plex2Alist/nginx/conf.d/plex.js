@@ -23,31 +23,31 @@ function isMsApiUrl(url, msAddr, msPublicAddr) {
 }
 
 /**
- * 处理 MS API URL 请求，获取重定向链接
+ * 通用重定向URL请求函数，获取重定向链接
  * @param {Object} r - Nginx JavaScript对象，代表HTTP请求
- * @param {String} url - MS API URL
+ * @param {String} url - 请求URL
  * @param {String} ua - User-Agent
- * @param {Number} timeout - 超时时间（毫秒），默认 30000
+ * @param {Number} timeout - 超时时间（毫秒），默认 60000
  * @returns {Promise<String|null>} 重定向链接，失败返回 null
  */
-async function fetchMsApiRedirect(r, url, ua, timeout) {
+async function fetchRedirectUrl(r, url, ua, timeout) {
   // NJS 不支持默认参数，在函数内部处理
   if (timeout === undefined || timeout === null) {
-    timeout = 30000;
+    timeout = 60000; // 默认超时时间改为60秒
   }
   
-  // 构造缓存键
-  const cacheKey = `msapi:${url}:${ua}`;
+  // 构造缓存键，使用URL和UA的哈希值以减少缓存键长度
+  const crypto = require('crypto');
+  const urlHash = crypto.createHash('md5').update(url).digest('hex');
+  const uaHash = crypto.createHash('md5').update(ua).digest('hex');
+  const cacheKey = `redirect:${urlHash}:${uaHash}`;
   
   // 检查缓存
   const cachedResult = ngx.shared.routeL1Dict.get(cacheKey);
   if (cachedResult) {
-    r.warn(`fetchMsApiRedirect: hit cache for ${url}, returning cached result`);
     return cachedResult;
   }
-  
-  r.warn(`fetchMsApiRedirect: requesting ${url}, timeout: ${timeout}ms`);
-  const start = Date.now();
+
   try {
     const response = await ngx.fetch(url, {
       method: "GET",
@@ -57,46 +57,44 @@ async function fetchMsApiRedirect(r, url, ua, timeout) {
       max_response_body_size: 65535,
       timeout: timeout
     });
-    const end = Date.now();
-    r.warn(`fetchMsApiRedirect: response status: ${response.status}, cost: ${end - start}ms`);
-    r.warn(`fetchMsApiRedirect full response: ${JSON.stringify(response)}`);
-
     // 处理302/301重定向响应，获取Location头中的URL
     if (response.status === 302 || response.status === 301) {
       const location = response.headers["Location"];
       if (location) {
-        r.warn(`MS API returned redirect to: ${location}`);
+        r.warn(`Redirect URL returned redirect to: ${location}`);
         // 只有成功的结果才缓存，缓存时间5分钟
         util.dictAdd("routeL1Dict", cacheKey, location, 5 * 60 * 1000);
         return location;
       } else {
-        r.warn(`MS API returned ${response.status} without Location header`);
+        r.warn(`Redirect URL returned ${response.status} without Location header`);
         return null;
       }
     } else if (response.ok) {
       // 处理 JSON 响应（用于 strm302 API）
       try {
         const result = await response.json();
-        r.warn(`fetchMsApiRedirect: JSON response: ${JSON.stringify(result)}`);
+        // 优化：限制日志长度，避免过长的日志输出
+        const resultStr = JSON.stringify(result);
+        r.warn(`fetchRedirectUrl: JSON response: ${resultStr.length > 1000 ? resultStr.substring(0, 1000) + '...' : resultStr}`);
         if (result && result.url) {
-          r.warn(`MS API returned URL from JSON: ${result.url}`);
+          r.warn(`Redirect URL returned URL from JSON: ${result.url}`);
           // 只有成功的结果才缓存，缓存时间5分钟
           util.dictAdd("routeL1Dict", cacheKey, result.url, 5 * 60 * 1000);
           return result.url;
         } else {
-          r.warn(`MS API JSON response missing url field`);
+          r.warn(`Redirect URL JSON response missing url field`);
           return null;
         }
       } catch (jsonError) {
-        r.error(`MS API JSON parse failed: ${jsonError}`);
+        r.error(`Redirect URL JSON parse failed: ${jsonError}`);
         return null;
       }
     } else {
-      r.warn(`MS API returned status ${response.status}, not 200/301/302`);
+      r.warn(`Redirect URL returned status ${response.status}, not 200/301/302`);
       return null;
     }
   } catch (error) {
-    r.error(`MS API request failed: ${error}`);
+    r.error(`Redirect URL request failed: ${error}`);
     return null;
   }
 }
@@ -117,6 +115,7 @@ async function redirect2Pan(r) {
     return internalRedirect(r);
   }
 
+  // 提前获取 User-Agent 并存储在变量中，避免重复获取
   const ua = r.headersIn["User-Agent"];
   r.warn(`redirect2Pan, UA: ${ua}`);
 
@@ -204,12 +203,12 @@ async function redirect2Pan(r) {
   // 优化：提前检查 MS API URL，如果是则跳过符号链接检查等后续步骤
   if (isMsApiUrl(mediaServerRes.path, msAddr, msPublicAddr)) {
     r.warn(`mediaServerRes.path is MS API URL, processing directly before symlink check`);
-    const redirectUrl = await fetchMsApiRedirect(r, mediaServerRes.path, ua, 30000);
+    const redirectUrl = await util.cost(fetchRedirectUrl, r, mediaServerRes.path, ua, 60000);
     if (redirectUrl) {
-      r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
+      r.warn(`fetchRedirectUrl success, redirecting to: ${redirectUrl}`);
       return redirect(r, redirectUrl);
     } else {
-      r.warn(`fetchMsApiRedirect failed, will continue with symlink check`);
+      r.warn(`fetchRedirectUrl failed, will continue with symlink check`);
     }
   }
 
@@ -251,39 +250,46 @@ async function redirect2Pan(r) {
   
   // strm支持处理
   if (notLocal) {
-    const strmInnerText = await util.cost(fetchStrmInnerText, r);
-    // 检查是否返回了错误信息
+    // 优化：添加重试机制，最多重试2次
+    let strmInnerText;
+    let retryCount = 0;
+    const maxRetries = 2;
+    
+    while (retryCount <= maxRetries) {
+      strmInnerText = await util.cost(fetchStrmInnerText, r);
+      // 检查是否返回了错误信息
+      if (!strmInnerText.startsWith("error")) {
+        break;
+      }
+      
+      r.warn(`fetchStrmInnerText failed (attempt ${retryCount + 1}): ${strmInnerText}`);
+      retryCount++;
+      
+      if (retryCount <= maxRetries) {
+        // 等待一段时间再重试，使用指数退避策略
+        await new Promise(resolve => setTimeout(resolve, Math.pow(2, retryCount) * 1000));
+      }
+    }
+    
+    // 如果所有重试都失败了，使用原始链接
     if (strmInnerText.startsWith("error")) {
-      r.error(`fetchStrmInnerText failed: ${strmInnerText}`);
-      // 如果获取STRM内容失败，使用原始链接
+      r.error(`fetchStrmInnerText failed after ${maxRetries + 1} attempts: ${strmInnerText}`);
       return internalRedirect(r);
     }
     
     r.warn(`fetchStrmInnerText cover mount plex file path: ${strmInnerText}`);
     mediaServerRes.path = strmInnerText;
     
-    // 如果STRM文件内容已经是MS API的URL，直接处理它
-    if (isMsApiUrl(strmInnerText, msAddr, msPublicAddr)) {
-      r.warn(`STRM content is already MS API URL, processing directly`);
-      const redirectUrl = await fetchMsApiRedirect(r, strmInnerText, ua, 30000);
-      if (redirectUrl) {
-        r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
-        return redirect(r, redirectUrl);
-      } else {
-        r.warn(`fetchMsApiRedirect failed or returned null, will continue with original MS API URL`);
-        // 如果请求失败，继续后续处理，但不要再次处理 MS API URL
-        // 设置一个标记，避免后续重复处理
-        mediaServerRes.path = strmInnerText;
-        mediaServerRes.skipMsApiCheck = true;
-        
-        // 在这里添加额外的处理逻辑，尝试其他方式获取直链
-        r.warn(`Trying fallback method to get direct link`);
-        const fallbackUrl = await tryFallbackMethods(r, strmInnerText, ua);
-        if (fallbackUrl) {
-          r.warn(`Fallback method success, redirecting to: ${fallbackUrl}`);
-          return redirect(r, fallbackUrl);
-        }
-      }
+    // 优化：无论STRM内容是什么，都直接通过fetchRedirectUrl处理
+    // fetchRedirectUrl可以处理各种类型的URL，包括MS API URL和其他直链
+    const redirectUrl = await util.cost(fetchRedirectUrl, r, strmInnerText, ua, 60000);
+    if (redirectUrl) {
+      r.warn(`fetchRedirectUrl success, redirecting to: ${redirectUrl}`);
+      return redirect(r, redirectUrl);
+    } else {
+      r.warn(`fetchRedirectUrl failed or returned null, will continue with original processing`);
+      // 如果请求失败，继续后续处理
+      mediaServerRes.path = strmInnerText;
     }
   }
 
@@ -332,15 +338,15 @@ async function redirect2Pan(r) {
   }
 
   // 如果是MS API URL且不是STRM文件，直接处理
-  // 但跳过已经在 STRM 处理中失败的情况
-  if (!mediaServerRes.skipMsApiCheck && isMsApiUrl(mediaItemPath, msAddr, msPublicAddr)) {
+  // 处理MS API URL
+  if (isMsApiUrl(mediaItemPath, msAddr, msPublicAddr)) {
     r.warn(`Direct processing of MS API URL: ${mediaItemPath}`);
-    const redirectUrl = await fetchMsApiRedirect(r, mediaItemPath, ua, 30000);
+    const redirectUrl = await util.cost(fetchRedirectUrl, r, mediaItemPath, ua, 60000);
     if (redirectUrl) {
-      r.warn(`fetchMsApiRedirect success, redirecting to: ${redirectUrl}`);
+      r.warn(`fetchRedirectUrl success, redirecting to: ${redirectUrl}`);
       return redirect(r, redirectUrl);
     } else {
-      r.warn(`fetchMsApiRedirect failed for direct MS API URL, will fallback to original URL`);
+      r.warn(`fetchRedirectUrl failed for direct MS API URL, will fallback to original URL`);
     }
   }
 
@@ -360,12 +366,20 @@ async function redirect2Pan(r) {
   if (msAddr && msApiKey) {
     const msApiPath = `${msAddr}/api/v1/cloudStorage/strm302?apiKey=${msApiKey}&path=${encodeURIComponent(alistFilePath)}`;
     r.warn(`fetching direct link from MS API: ${msApiPath}`);
-    const redirectUrl = await fetchMsApiRedirect(r, msApiPath, ua, 15000);
+    const redirectUrl = await util.cost(fetchRedirectUrl, r, msApiPath, ua, 60000);
     if (redirectUrl) {
       alistRes = redirectUrl;
       isUsingMsApi = true;
     } else {
       alistRes = `error: MS API request failed or invalid response`;
+      // 回退到原来的逻辑
+      ngx.log(ngx.WARN, `about to call fetchAlistPathApi with: apiPath=${alistFsGetApiPath}, filePath=${alistFilePath}`);
+      alistRes = await util.cost(fetchAlistPathApi,
+        alistFsGetApiPath,
+        alistFilePath,
+        alistToken,
+        ua,
+      );
     }
   } else {
     // 回退到原来的逻辑
@@ -695,28 +709,84 @@ async function fetchStrmInnerText(r) {
   const plexHost = config.plexHost;
   const api_key = r.args[util.ARGS.plexTokenKey] || r.headersIn[util.ARGS.plexTokenKey];
   const downloadApiPath = `${plexHost}${r.uri}?download=1&${util.ARGS.plexTokenKey}=${api_key}`;
+  
+  // 检查是否启用STRM内容缓存
+  const enableStrmCache = config.routeCacheConfig.enable ?? false;
+  const cacheExpireTime = 5 * 60 * 1000; // 默认5分钟
+  let cacheKey = null;
+  
+  // 记录请求信息
+  r.warn(`fetchStrmInnerText: requesting ${downloadApiPath}`);
+  
+  if (enableStrmCache) {
+    // 构造缓存键，使用URL的哈希值以减少缓存键长度
+    const crypto = require('crypto');
+    cacheKey = `strm:${crypto.createHash('md5').update(downloadApiPath).digest('hex')}`;
+    
+    // 检查缓存
+    const cachedResult = ngx.shared.routeL1Dict.get(cacheKey);
+    if (cachedResult) {
+      r.warn(`fetchStrmInnerText: hit cache for ${downloadApiPath}, returning cached result`);
+      return cachedResult;
+    }
+    r.warn(`fetchStrmInnerText: cache enabled but miss, will request from source`);
+  } else {
+    r.warn(`fetchStrmInnerText: cache disabled, will request from source`);
+  }
+  
   try {
-  	// fetch Api忽略nginx位置
+    // 记录请求开始时间
+    const start = Date.now();
+    
+    // fetch Api忽略nginx位置
     const response = await ngx.fetch(downloadApiPath, {
       method: "HEAD",
       max_response_body_size: 1024,
       timeout: 30000 // 30秒超时
     });
+    
+    // 记录请求耗时
+    const end = Date.now();
+    r.warn(`fetchStrmInnerText: response status: ${response.status}, cost: ${end - start}ms`);
+    
     // plex strm downloadApi自己返回301，response.redirected api错误返回false
     if (response.status > 300 && response.status < 309) {
       const location = response.headers["Location"];
       // 对于STRM文件，我们直接返回重定向位置，不做任何修改
       // 因为它可能指向完全不同的服务（如AList、CloudDrive等）
       r.log(`fetchStrmInnerText: ${location}，decodeURI(location): ${decodeURI(location)}`);
-      return decodeURI(location);
+      const result = decodeURI(location);
+      
+      // 如果启用了缓存，则将结果存入缓存
+      if (enableStrmCache && cacheKey) {
+        // 使用配置的缓存过期时间
+        util.dictAdd("routeL1Dict", cacheKey, result, cacheExpireTime);
+        r.warn(`fetchStrmInnerText: cached result for ${downloadApiPath}`);
+      }
+      
+      r.warn(`fetchStrmInnerText: success, returned redirect location`);
+      return result;
     }
     if (response.ok) {
-      r.log(`fetchStrmInnerText: ${response.text()}`);
-      return decodeURI(response.text());
+      const responseText = response.text();
+      r.log(`fetchStrmInnerText: ${responseText}`);
+      const result = decodeURI(responseText);
+      
+      // 如果启用了缓存，则将结果存入缓存
+      if (enableStrmCache && cacheKey) {
+        // 使用配置的缓存过期时间
+        util.dictAdd("routeL1Dict", cacheKey, result, cacheExpireTime);
+        r.warn(`fetchStrmInnerText: cached result for ${downloadApiPath}`);
+      }
+      
+      r.warn(`fetchStrmInnerText: success, returned content`);
+      return result;
     } else {
+      r.warn(`fetchStrmInnerText: error response ${response.status} ${response.statusText}`);
       return `error: plex_download_api ${response.status} ${response.statusText}`;
     }
   } catch (error) {
+    r.error(`fetchStrmInnerText: request failed ${error}`);
     return `error: plex_download_api fetchStrmInnerText ${error}`;
   }
 }
