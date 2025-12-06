@@ -362,14 +362,12 @@ async function redirect2Pan(r) {
   
   // 使用新的MS API获取直链
   let alistRes;
-  let isUsingMsApi = false;
   if (msAddr && msApiKey) {
     const msApiPath = `${msAddr}/api/v1/cloudStorage/strm302?apiKey=${msApiKey}&path=${encodeURIComponent(alistFilePath)}`;
     r.warn(`fetching direct link from MS API: ${msApiPath}`);
     const redirectUrl = await util.cost(fetchRedirectUrl, r, msApiPath, ua, 60000);
     if (redirectUrl) {
       alistRes = redirectUrl;
-      isUsingMsApi = true;
     } else {
       alistRes = `error: MS API request failed or invalid response`;
       // 回退到原来的逻辑
@@ -404,8 +402,8 @@ async function redirect2Pan(r) {
       return internalRedirect(r); // 使用原始链接
     }
     // 客户端自定义AList规则，在获取AList之后，覆盖raw_url
-    // 如果是使用MS API获取的链接，则跳过clientSelfAlistRule处理
-    let redirectUrl = isUsingMsApi ? alistRes : (util.getClientSelfAlistLink(r, alistRes, alistFilePath) ?? alistRes);
+    // let redirectUrl = util.getClientSelfAlistLink(r, alistRes, alistFilePath) ?? alistRes;
+    let redirectUrl =  alistRes;
     // r.warn(`getClientSelfAlistLink result: ${redirectUrl}`);
     const key = "alistRawUrlMapping";
     if (config[key] && config[key].length > 0) {
